@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 import webbrowser
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +32,7 @@ UPLOADS_DIR = DATA_DIR / "videos"
 AUDIO_DIR = DATA_DIR / "audio"
 TRANSCRIPTIONS_DIR = DATA_DIR / "transcripciones"
 MODELS_DIR = DATA_DIR / "modelos"
+QUEUE_RESUME_FILE = DATA_DIR / "reanudar_cola.json"
 MAX_BATCH_FILES = int(os.environ.get("WHISPERMAX_MAX_BATCH_FILES", "55"))
 MAX_UPLOAD_MB = int(os.environ.get("WHISPERMAX_MAX_UPLOAD_MB", "2048"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
@@ -119,6 +120,7 @@ async def lifespan(_: FastAPI):
     apply_resource_limits(DEFAULT_RESOURCE_MODE)
     ensure_output_folders()
     ensure_worker_started()
+    resume_saved_queue()
     yield
 
 
@@ -177,6 +179,47 @@ def safe_stem(filename: str) -> str:
     stem = Path(filename).stem.strip() or "video"
     stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem)
     return stem.strip("._-") or "video"
+
+
+def path_inside(path: Path, folder: Path) -> bool:
+    try:
+        resolved_path = path.resolve()
+        resolved_folder = folder.resolve()
+    except OSError:
+        return False
+    return resolved_folder == resolved_path or resolved_folder in resolved_path.parents
+
+
+def resume_saved_queue() -> None:
+    if not QUEUE_RESUME_FILE.exists():
+        return
+
+    try:
+        payload = json.loads(QUEUE_RESUME_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+
+    queued = 0
+    for item in payload.get("jobs", []):
+        video_path = Path(str(item.get("video_path", "")))
+        if not path_inside(video_path, UPLOADS_DIR) or not video_path.exists():
+            continue
+        enqueue_transcription(
+            video_path=video_path,
+            original_name=str(item.get("original_name") or video_path.name),
+            model_name=str(item.get("model_name") or "tiny"),
+            language=str(item.get("language") or "es"),
+            resource_mode=str(item.get("resource_mode") or DEFAULT_RESOURCE_MODE),
+        )
+        queued += 1
+
+    consumed = QUEUE_RESUME_FILE.with_suffix(".cargada.json")
+    try:
+        if consumed.exists():
+            consumed.unlink()
+        QUEUE_RESUME_FILE.replace(consumed)
+    except OSError:
+        pass
 
 
 async def save_upload(upload: UploadFile) -> Path:
@@ -395,6 +438,54 @@ def load_whisper_model(model_name: str, resource_mode: str = DEFAULT_RESOURCE_MO
     return model
 
 
+@contextmanager
+def whisper_progress(job: TranscriptionJob | None):
+    if job is None:
+        yield
+        return
+
+    import importlib
+
+    transcribe_module = importlib.import_module("whisper.transcribe")
+    original_tqdm = transcribe_module.tqdm.tqdm
+
+    class JobProgressBar:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self._bar = original_tqdm(*args, **kwargs)
+
+        def __enter__(self):
+            self._bar.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> bool:
+            return self._bar.__exit__(exc_type, exc, traceback)
+
+        def update(self, amount: int | float = 1):
+            result = self._bar.update(amount)
+            total = getattr(self._bar, "total", 0) or 0
+            current = getattr(self._bar, "n", 0) or 0
+            if total:
+                whisper_percent = min(99, int((current / total) * 100))
+                job_percent = min(88, 45 + int(whisper_percent * 0.43))
+                update_job(
+                    job,
+                    status="Transcribiendo",
+                    detail=f"Whisper esta procesando el audio ({whisper_percent}%)",
+                    progress=job_percent,
+                )
+            raise_if_cancelled(job)
+            return result
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._bar, name)
+
+    transcribe_module.tqdm.tqdm = JobProgressBar
+    try:
+        yield
+    finally:
+        transcribe_module.tqdm.tqdm = original_tqdm
+
+
 def transcribe_audio(
     audio_path: Path,
     model_name: str,
@@ -417,7 +508,8 @@ def transcribe_audio(
     options: dict[str, Any] = {"fp16": False}
     if language:
         options["language"] = language
-    transcription = model.transcribe(str(audio_path), **options)
+    with whisper_progress(job):
+        transcription = model.transcribe(str(audio_path), **options)
     raise_if_cancelled(job)
     update_job(job, status="Generando DOCX", detail="Creando documentos de salida", progress=90)
     return transcription
