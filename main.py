@@ -466,12 +466,11 @@ def whisper_progress(job: TranscriptionJob | None):
             current = getattr(self._bar, "n", 0) or 0
             if total:
                 whisper_percent = min(99, int((current / total) * 100))
-                job_percent = min(88, 45 + int(whisper_percent * 0.43))
                 update_job(
                     job,
                     status="Transcribiendo",
                     detail=f"Whisper esta procesando el audio ({whisper_percent}%)",
-                    progress=job_percent,
+                    progress=whisper_percent,
                 )
             raise_if_cancelled(job)
             return result
@@ -502,8 +501,8 @@ def transcribe_audio(
     update_job(
         job,
         status="Transcribiendo",
-        detail=f"Whisper esta procesando con consumo {profile['label']} ({profile['threads']} hilo/s)",
-        progress=45,
+        detail=f"Whisper esta procesando el audio (0%) con consumo {profile['label']} ({profile['threads']} hilo/s)",
+        progress=0,
     )
     options: dict[str, Any] = {"fp16": False}
     if language:

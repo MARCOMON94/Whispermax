@@ -31,7 +31,7 @@ La cola incluye:
 - Boton `Cancelar` independiente para cada video.
 - Panel limpio con un unico trabajo activo y su barra de progreso.
 - Lista separada de pendientes, sin barras falsas al 0%.
-- Avance interno durante la transcripcion de Whisper cuando el modelo informa progreso.
+- Durante `Transcribiendo`, la barra muestra el mismo porcentaje interno que informa Whisper.
 - Limpieza automatica del video subido y del audio WAV temporal al completar, fallar o cancelar.
 - Selector de consumo: `Bajo` usa menos hilos y prioridad baja para evitar picos de CPU.
 
