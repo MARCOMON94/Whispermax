@@ -45,6 +45,7 @@ Por defecto:
 - `Bajo`: 1 hilo para Whisper/Torch y 1 hilo para `ffmpeg`.
 - `Medio`: 2 hilos para Whisper/Torch y 1 hilo para `ffmpeg`.
 - `Rapido`: 4 hilos para Whisper/Torch y 2 hilos para `ffmpeg`.
+- `Ultrarrapido`: hasta 8 hilos para Whisper/Torch y 2 hilos para `ffmpeg`.
 - Maximo 55 videos por tanda.
 - Maximo 2048 MB por archivo subido.
 
@@ -53,6 +54,7 @@ Puedes cambiar los limites antes de arrancar:
 ```powershell
 $env:WHISPERMAX_MAX_BATCH_FILES = "3"
 $env:WHISPERMAX_MAX_UPLOAD_MB = "1024"
+$env:WHISPERMAX_FAST_THREADS = "8"
 python main.py
 ```
 

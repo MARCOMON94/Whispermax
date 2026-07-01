@@ -37,6 +37,7 @@ MAX_BATCH_FILES = int(os.environ.get("WHISPERMAX_MAX_BATCH_FILES", "55"))
 MAX_UPLOAD_MB = int(os.environ.get("WHISPERMAX_MAX_UPLOAD_MB", "2048"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+FAST_THREADS = int(os.environ.get("WHISPERMAX_FAST_THREADS", str(min(8, os.cpu_count() or 4))))
 
 RESOURCE_PROFILES = {
     "low": {
@@ -56,6 +57,13 @@ RESOURCE_PROFILES = {
     "fast": {
         "label": "Rapido",
         "threads": 4,
+        "ffmpeg_threads": 2,
+        "priority": "normal",
+        "pause_seconds": 0.0,
+    },
+    "ultrafast": {
+        "label": "Ultrarrapido",
+        "threads": FAST_THREADS,
         "ffmpeg_threads": 2,
         "priority": "normal",
         "pause_seconds": 0.0,
@@ -1264,6 +1272,7 @@ HTML_PAGE = f"""
               <option value="low" selected>Bajo</option>
               <option value="balanced">Medio</option>
               <option value="fast">Rapido</option>
+              <option value="ultrafast">Ultrarrapido</option>
             </select>
           </div>
         </div>
