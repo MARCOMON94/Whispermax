@@ -677,6 +677,12 @@ def enqueue_transcription(
 
 
 def job_to_dict(job: TranscriptionJob) -> dict[str, str]:
+    progress = str(job.progress)
+    if job.status == "Transcribiendo":
+        match = re.search(r"\((\d{1,3})%\)", job.detail)
+        if match:
+            progress = str(max(0, min(100, int(match.group(1)))))
+
     return {
         "id": job.id,
         "original_name": job.original_name,
@@ -686,7 +692,7 @@ def job_to_dict(job: TranscriptionJob) -> dict[str, str]:
         "resource_label": str(get_resource_profile(job.resource_mode)["label"]),
         "status": job.status,
         "detail": job.detail,
-        "progress": str(job.progress),
+        "progress": progress,
         "created_at": job.created_at,
         "started_at": job.started_at,
         "completed_at": job.completed_at,
@@ -854,6 +860,14 @@ def queue_page(submitted_jobs: list[TranscriptionJob]) -> str:
             return escapeHtml(name || "Video");
           }}
 
+          function progressFromJob(job) {{
+            const detailMatch = String(job.detail || "").match(/\\((\\d{{1,3}})%\\)/);
+            if (job.status === "Transcribiendo" && detailMatch) {{
+              return Math.max(0, Math.min(100, Number(detailMatch[1])));
+            }}
+            return Math.max(0, Math.min(100, Number(job.progress || 0)));
+          }}
+
           async function cancelJob(jobId) {{
             const button = document.querySelector(`[data-cancel="${{jobId}}"]`);
             if (button) {{
@@ -882,7 +896,7 @@ def queue_page(submitted_jobs: list[TranscriptionJob]) -> str:
               return;
             }}
 
-            const progress = Number(job.progress || 0);
+            const progress = progressFromJob(job);
             wrapper.classList.toggle("working", job.status === "Transcribiendo");
             title.textContent = job.original_name || "Video";
             detail.textContent = `${{job.status}} · ${{job.error || job.detail || job.model_name}}`;
