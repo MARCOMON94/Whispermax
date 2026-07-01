@@ -114,6 +114,7 @@ class TranscriptionJob:
     error: str = ""
     detail: str = "Esperando turno"
     progress: int = 0
+    updated_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     cancel_requested: bool = False
     audio_path: str = ""
     current_process: subprocess.Popen[str] | None = field(default=None, repr=False, compare=False)
@@ -289,6 +290,7 @@ def update_job(
             job.progress = max(0, min(100, progress))
         if error is not None:
             job.error = error
+        job.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if completed:
             job.completed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -703,6 +705,7 @@ def job_to_dict(job: TranscriptionJob) -> dict[str, str]:
         "progress": progress,
         "created_at": job.created_at,
         "started_at": job.started_at,
+        "updated_at": job.updated_at,
         "completed_at": job.completed_at,
         "docx_name": job.docx_name,
         "txt_name": job.txt_name,
@@ -896,6 +899,7 @@ def queue_page(submitted_jobs: list[TranscriptionJob]) -> str:
 
             if (!job) {{
               wrapper.classList.remove("working");
+              wrapper.classList.remove("waiting-progress");
               title.textContent = "Sin video activo";
               detail.textContent = "La cola esta esperando el siguiente trabajo.";
               fill.style.width = "0%";
@@ -905,11 +909,14 @@ def queue_page(submitted_jobs: list[TranscriptionJob]) -> str:
             }}
 
             const progress = progressFromJob(job);
-            wrapper.classList.toggle("working", job.status === "Transcribiendo");
+            const isTranscribing = job.status === "Transcribiendo";
+            const isWaitingForFirstProgress = isTranscribing && progress === 0;
+            wrapper.classList.toggle("working", isTranscribing);
+            wrapper.classList.toggle("waiting-progress", isWaitingForFirstProgress);
             title.textContent = job.original_name || "Video";
             detail.textContent = `${{job.status}} · ${{job.error || job.detail || job.model_name}}`;
-            fill.style.width = `${{progress}}%`;
-            text.textContent = `${{progress}}%`;
+            fill.style.width = isWaitingForFirstProgress ? "18%" : `${{progress}}%`;
+            text.textContent = isWaitingForFirstProgress ? `${{progress}}% real - trabajando` : `${{progress}}%`;
             actions.innerHTML = `${{downloadLinks(job)}}<button class="button danger small" type="button" data-cancel="${{job.id}}" onclick="cancelJob('${{job.id}}')" ${{job.can_cancel !== "true" ? "disabled" : ""}}>Cancelar</button>`;
           }}
 
@@ -1116,6 +1123,11 @@ td span {
   animation: progress-stripes 0.9s linear infinite;
 }
 
+.active-job.waiting-progress .progress-fill {
+  animation: progress-stripes 0.9s linear infinite, progress-waiting 1.4s ease-in-out infinite alternate;
+  transition: none;
+}
+
 .progress-text {
   margin-top: 5px;
 }
@@ -1203,6 +1215,15 @@ td span {
   }
   to {
     background-position: 22px 0;
+  }
+}
+
+@keyframes progress-waiting {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(450%);
   }
 }
 
