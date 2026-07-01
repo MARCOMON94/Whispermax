@@ -514,7 +514,7 @@ def transcribe_audio(
         detail=f"Whisper esta procesando el audio (0%) con consumo {profile['label']} ({profile['threads']} hilo/s)",
         progress=0,
     )
-    options: dict[str, Any] = {"fp16": False}
+    options: dict[str, Any] = {"fp16": False, "verbose": False}
     if language:
         options["language"] = language
     with whisper_progress(job):
