@@ -195,7 +195,7 @@ def resume_saved_queue() -> None:
         return
 
     try:
-        payload = json.loads(QUEUE_RESUME_FILE.read_text(encoding="utf-8"))
+        payload = json.loads(QUEUE_RESUME_FILE.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return
 
@@ -780,28 +780,6 @@ async def download(filename: str) -> FileResponse:
 
 def queue_page(submitted_jobs: list[TranscriptionJob]) -> str:
     job_ids = json.dumps([job.id for job in submitted_jobs])
-    rows = "\n".join(
-        f"""
-          <tr id="job-{html.escape(job.id)}">
-            <td class="file-cell">{html.escape(job.original_name)}</td>
-            <td>
-              <div class="progress">
-                <div class="progress-fill" data-progress-fill style="width: {job.progress}%"></div>
-              </div>
-              <span class="progress-text" data-progress-text>{job.progress}%</span>
-            </td>
-            <td>
-              <strong data-status>{html.escape(job.status)}</strong>
-              <span data-detail>{html.escape(job.detail)}</span>
-            </td>
-            <td data-downloads></td>
-            <td data-actions>
-              <button class="button danger small" type="button" data-cancel onclick="cancelJob('{html.escape(job.id)}')">Cancelar</button>
-            </td>
-          </tr>
-        """
-        for job in submitted_jobs
-    )
     return f"""
     <!doctype html>
     <html lang="es">
@@ -814,23 +792,33 @@ def queue_page(submitted_jobs: list[TranscriptionJob]) -> str:
       <body>
         <main class="panel wide">
           <h1>Cola de transcripcion</h1>
-          <p>Los videos se procesaran de uno en uno. Los documentos terminados quedan en <code>salidas/transcripciones</code>.</p>
-          <div class="table-wrap">
-            <table class="queue">
-              <thead>
-                <tr>
-                  <th>Archivo</th>
-                  <th>Progreso</th>
-                  <th>Estado</th>
-                  <th>Descarga</th>
-                  <th>Accion</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows}
-              </tbody>
-            </table>
-          </div>
+          <p>Se procesa un solo video cada vez. Los documentos terminados quedan en <code>salidas/transcripciones</code>.</p>
+
+          <section class="active-job" id="active-job">
+            <div>
+              <span class="eyebrow">Ahora</span>
+              <h2 id="active-title">Preparando cola</h2>
+              <p id="active-detail">Leyendo estado...</p>
+            </div>
+            <div class="progress large">
+              <div class="progress-fill" id="active-progress-fill" style="width: 0%"></div>
+            </div>
+            <div class="active-footer">
+              <span class="progress-text" id="active-progress-text">0%</span>
+              <div class="actions inline" id="active-actions"></div>
+            </div>
+          </section>
+
+          <details class="queue-section" open>
+            <summary><span id="pending-count">0</span> pendientes</summary>
+            <ul class="job-list" id="pending-list"></ul>
+          </details>
+
+          <details class="queue-section" id="done-section">
+            <summary><span id="done-count">0</span> terminados</summary>
+            <ul class="job-list" id="done-list"></ul>
+          </details>
+
           <a class="back" href="/">Anadir mas videos</a>
         </main>
         <script>
@@ -849,9 +837,26 @@ def queue_page(submitted_jobs: list[TranscriptionJob]) -> str:
             return job.status === "Completado" || job.status === "Cancelado" || job.status === "Error";
           }}
 
+          function isActive(job) {{
+            return !isTerminal(job) && job.status !== "En cola";
+          }}
+
+          function escapeHtml(value) {{
+            return String(value ?? "").replace(/[&<>"']/g, (char) => ({{
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              "\\"": "&quot;",
+              "'": "&#039;"
+            }}[char]));
+          }}
+
+          function compactName(name) {{
+            return escapeHtml(name || "Video");
+          }}
+
           async function cancelJob(jobId) {{
-            const row = document.getElementById(`job-${{jobId}}`);
-            const button = row?.querySelector("[data-cancel]");
+            const button = document.querySelector(`[data-cancel="${{jobId}}"]`);
             if (button) {{
               button.disabled = true;
               button.textContent = "Cancelando";
@@ -860,31 +865,68 @@ def queue_page(submitted_jobs: list[TranscriptionJob]) -> str:
             refreshQueue();
           }}
 
+          function renderActive(job) {{
+            const wrapper = document.getElementById("active-job");
+            const title = document.getElementById("active-title");
+            const detail = document.getElementById("active-detail");
+            const fill = document.getElementById("active-progress-fill");
+            const text = document.getElementById("active-progress-text");
+            const actions = document.getElementById("active-actions");
+
+            if (!job) {{
+              wrapper.classList.remove("working");
+              title.textContent = "Sin video activo";
+              detail.textContent = "La cola esta esperando el siguiente trabajo.";
+              fill.style.width = "0%";
+              text.textContent = "0%";
+              actions.innerHTML = "";
+              return;
+            }}
+
+            const progress = Number(job.progress || 0);
+            wrapper.classList.toggle("working", job.status === "Transcribiendo");
+            title.textContent = job.original_name || "Video";
+            detail.textContent = `${{job.status}} · ${{job.error || job.detail || job.model_name}}`;
+            fill.style.width = `${{progress}}%`;
+            text.textContent = `${{progress}}%`;
+            actions.innerHTML = `${{downloadLinks(job)}}<button class="button danger small" type="button" data-cancel="${{job.id}}" onclick="cancelJob('${{job.id}}')" ${{job.can_cancel !== "true" ? "disabled" : ""}}>Cancelar</button>`;
+          }}
+
+          function renderPending(jobs) {{
+            const list = document.getElementById("pending-list");
+            document.getElementById("pending-count").textContent = jobs.length;
+            list.innerHTML = jobs.map((job) => `
+              <li class="job-row">
+                <span>${{compactName(job.original_name)}}</span>
+                <button class="button danger small" type="button" data-cancel="${{job.id}}" onclick="cancelJob('${{job.id}}')" ${{job.can_cancel !== "true" ? "disabled" : ""}}>Cancelar</button>
+              </li>
+            `).join("") || `<li class="empty-row">No hay videos pendientes.</li>`;
+          }}
+
+          function renderDone(jobs) {{
+            const list = document.getElementById("done-list");
+            document.getElementById("done-count").textContent = jobs.length;
+            list.innerHTML = jobs.map((job) => `
+              <li class="job-row done">
+                <span>${{compactName(job.original_name)}}<small>${{escapeHtml(job.status)}}</small></span>
+                <span class="download-cell">${{downloadLinks(job)}}</span>
+              </li>
+            `).join("") || `<li class="empty-row">Todavia no hay trabajos terminados en esta cola.</li>`;
+          }}
+
           async function refreshQueue() {{
             const response = await fetch(`/estado?ids=${{jobIds.join(",")}}`, {{ cache: "no-store" }});
             const data = await response.json();
-            let pending = false;
+            const active = data.jobs.find(isActive);
+            const pendingJobs = data.jobs.filter((job) => job.status === "En cola");
+            const doneJobs = data.jobs.filter(isTerminal);
+            const stillRunning = data.jobs.some((job) => !isTerminal(job));
 
-            for (const job of data.jobs) {{
-              const row = document.getElementById(`job-${{job.id}}`);
-              if (!row) continue;
-              const progress = Number(job.progress || 0);
-              row.querySelector("[data-status]").textContent = job.status;
-              row.querySelector("[data-detail]").textContent = job.error || job.detail || job.model_name;
-              row.querySelector("[data-progress-fill]").style.width = `${{progress}}%`;
-              row.querySelector("[data-progress-text]").textContent = `${{progress}}%`;
-              row.querySelector("[data-downloads]").innerHTML = downloadLinks(job);
-              const cancelButton = row.querySelector("[data-cancel]");
-              if (cancelButton) {{
-                cancelButton.disabled = job.can_cancel !== "true";
-                cancelButton.textContent = job.status === "Cancelando" ? "Cancelando" : "Cancelar";
-              }}
-              if (!isTerminal(job)) {{
-                pending = true;
-              }}
-            }}
+            renderActive(active);
+            renderPending(pendingJobs);
+            renderDone(doneJobs);
 
-            if (pending) {{
+            if (stillRunning) {{
               window.setTimeout(refreshQueue, 2500);
             }}
           }}
@@ -1000,31 +1042,15 @@ button:disabled {
   gap: 10px;
 }
 
+.actions.inline {
+  align-items: center;
+  justify-content: flex-end;
+  margin-left: auto;
+}
+
 .button.small {
   margin: 0 6px 0 0;
   padding: 7px 10px;
-}
-
-.table-wrap {
-  overflow-x: auto;
-}
-
-table {
-  border-collapse: collapse;
-  width: 100%;
-}
-
-th,
-td {
-  border-bottom: 1px solid #d9e2ec;
-  padding: 10px 8px;
-  text-align: left;
-  vertical-align: middle;
-}
-
-th {
-  color: #52606d;
-  font-size: 13px;
 }
 
 .file-cell {
@@ -1051,14 +1077,112 @@ td span {
   overflow: hidden;
 }
 
+.progress.large {
+  height: 14px;
+  margin-top: 16px;
+  width: 100%;
+}
+
 .progress-fill {
   background: #0f766e;
   height: 100%;
   transition: width 0.25s ease;
 }
 
+.active-job.working .progress-fill {
+  background-image: linear-gradient(45deg, rgba(255, 255, 255, 0.35) 25%, transparent 25%, transparent 50%, rgba(255, 255, 255, 0.35) 50%, rgba(255, 255, 255, 0.35) 75%, transparent 75%, transparent);
+  background-size: 22px 22px;
+  animation: progress-stripes 0.9s linear infinite;
+}
+
 .progress-text {
   margin-top: 5px;
+}
+
+.active-job {
+  border: 1px solid #d9e2ec;
+  border-radius: 8px;
+  margin: 22px 0;
+  padding: 18px;
+}
+
+.active-job h2 {
+  font-size: 20px;
+  margin: 4px 0 6px;
+  overflow-wrap: anywhere;
+}
+
+.active-job p {
+  margin-bottom: 0;
+}
+
+.active-footer {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.eyebrow {
+  color: #0f766e;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.queue-section {
+  border-top: 1px solid #d9e2ec;
+  padding: 14px 0;
+}
+
+.queue-section summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.job-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+}
+
+.job-row {
+  align-items: center;
+  border-bottom: 1px solid #eef2f6;
+  display: flex;
+  gap: 14px;
+  justify-content: space-between;
+  padding: 10px 0;
+}
+
+.job-row span {
+  overflow-wrap: anywhere;
+}
+
+.job-row small {
+  color: #52606d;
+  display: block;
+  font-size: 12px;
+  margin-top: 3px;
+}
+
+.download-cell {
+  flex-shrink: 0;
+}
+
+.empty-row {
+  color: #52606d;
+  padding: 10px 0;
+}
+
+@keyframes progress-stripes {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 22px 0;
+  }
 }
 
 .back {

@@ -29,7 +29,9 @@ Cuando subes varios archivos, la app los deja en cola y los transcribe de uno en
 La cola incluye:
 
 - Boton `Cancelar` independiente para cada video.
-- Barra de progreso por fases y avance interno durante la transcripcion de Whisper.
+- Panel limpio con un unico trabajo activo y su barra de progreso.
+- Lista separada de pendientes, sin barras falsas al 0%.
+- Avance interno durante la transcripcion de Whisper cuando el modelo informa progreso.
 - Limpieza automatica del video subido y del audio WAV temporal al completar, fallar o cancelar.
 - Selector de consumo: `Bajo` usa menos hilos y prioridad baja para evitar picos de CPU.
 
