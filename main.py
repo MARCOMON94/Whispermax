@@ -703,6 +703,15 @@ async def home() -> str:
     return HTML_PAGE
 
 
+@app.get("/transcribir", response_class=HTMLResponse)
+async def current_queue_page() -> str:
+    with jobs_lock:
+        current_jobs = list(jobs.values())
+    if not current_jobs:
+        return HTML_PAGE
+    return queue_page(current_jobs)
+
+
 @app.post("/transcribir", response_class=HTMLResponse)
 async def transcribe(
     videos: list[UploadFile] = File(...),
