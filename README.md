@@ -1,6 +1,6 @@
 # Whispermax
 
-Aplicacion local con FastAPI para subir videos, extraer el audio con `ffmpeg`, transcribir con Whisper y guardar cada transcripcion como `.docx` y `.txt`.
+Aplicacion local con FastAPI para subir videos, extraer el audio con `ffmpeg`, transcribir con Whisper o `faster-whisper` y guardar cada transcripcion como `.docx` y `.txt`.
 
 ## Requisitos
 
@@ -33,6 +33,8 @@ La cola incluye:
 - Lista separada de pendientes, sin barras falsas al 0%.
 - Durante `Transcribiendo`, Whisper se ejecuta con progreso interno activo y la barra usa el porcentaje real que aparece en `Whisper esta procesando el audio (N%)`.
 - Si Whisper aun marca `0%`, la barra muestra actividad visual y el texto `0% real - trabajando` para indicar que el proceso sigue vivo sin inventar un porcentaje.
+- Los audios largos se dividen automaticamente en partes para evitar que Whisper cargue horas de audio de golpe y bloquee el equipo.
+- Si `faster-whisper` esta disponible, la app lo intenta usar primero en CPU con `int8`; si no puede cargar el modelo, vuelve a Whisper normal.
 - Limpieza automatica del video subido y del audio WAV temporal al completar, fallar o cancelar.
 - Selector de consumo: `Bajo` usa menos hilos y prioridad baja para evitar picos de CPU.
 
@@ -47,6 +49,7 @@ Por defecto:
 - `Medio`: 2 hilos para Whisper/Torch y 1 hilo para `ffmpeg`.
 - `Rapido`: 4 hilos para Whisper/Torch y 2 hilos para `ffmpeg`.
 - `Ultrarrapido`: hasta 8 hilos para Whisper/Torch y 2 hilos para `ffmpeg`.
+- Los audios de mas de 1200 segundos se procesan por partes; puedes cambiarlo con `WHISPERMAX_CHUNK_SECONDS`.
 - Maximo 55 videos por tanda.
 - Maximo 2048 MB por archivo subido.
 
@@ -56,6 +59,8 @@ Puedes cambiar los limites antes de arrancar:
 $env:WHISPERMAX_MAX_BATCH_FILES = "3"
 $env:WHISPERMAX_MAX_UPLOAD_MB = "1024"
 $env:WHISPERMAX_FAST_THREADS = "8"
+$env:WHISPERMAX_CHUNK_SECONDS = "1200"
+$env:WHISPERMAX_ENGINE = "faster"
 python main.py
 ```
 

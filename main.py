@@ -38,6 +38,8 @@ MAX_UPLOAD_MB = int(os.environ.get("WHISPERMAX_MAX_UPLOAD_MB", "2048"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 FAST_THREADS = int(os.environ.get("WHISPERMAX_FAST_THREADS", str(min(8, os.cpu_count() or 4))))
+TRANSCRIBE_CHUNK_SECONDS = int(os.environ.get("WHISPERMAX_CHUNK_SECONDS", "1200"))
+TRANSCRIPTION_ENGINE = os.environ.get("WHISPERMAX_ENGINE", "faster").strip().lower()
 
 RESOURCE_PROFILES = {
     "low": {
@@ -333,10 +335,25 @@ def delete_if_inside(path: Path, folder: Path) -> None:
         return
 
 
+def delete_dir_if_inside(path: Path, folder: Path) -> None:
+    try:
+        resolved_path = path.resolve()
+        resolved_folder = folder.resolve()
+        if resolved_folder not in resolved_path.parents:
+            return
+        if resolved_path.exists() and resolved_path.is_dir():
+            shutil.rmtree(resolved_path)
+    except OSError:
+        return
+
+
 def cleanup_job_files(job: TranscriptionJob) -> None:
-    delete_if_inside(job.video_path, UPLOADS_DIR)
+    if job.status != "Error":
+        delete_if_inside(job.video_path, UPLOADS_DIR)
     if job.audio_path:
-        delete_if_inside(Path(job.audio_path), AUDIO_DIR)
+        audio_path = Path(job.audio_path)
+        delete_if_inside(audio_path, AUDIO_DIR)
+        delete_dir_if_inside(AUDIO_DIR / f"{audio_path.stem}_chunks", AUDIO_DIR)
 
 
 def cleanup_output_files(job: TranscriptionJob) -> None:
@@ -429,8 +446,9 @@ def extract_audio(video_path: Path, job: TranscriptionJob | None = None) -> Path
 
 def load_whisper_model(model_name: str, resource_mode: str = DEFAULT_RESOURCE_MODE):
     apply_resource_limits(resource_mode)
+    cache_key = f"openai:{model_name}"
     with model_cache_lock:
-        cached_model = model_cache.get(model_name)
+        cached_model = model_cache.get(cache_key)
         if cached_model is not None:
             return cached_model
 
@@ -444,12 +462,45 @@ def load_whisper_model(model_name: str, resource_mode: str = DEFAULT_RESOURCE_MO
     model = whisper.load_model(model_name, download_root=str(MODELS_DIR))
     apply_resource_limits(resource_mode)
     with model_cache_lock:
-        model_cache[model_name] = model
+        model_cache[cache_key] = model
+    return model
+
+
+def load_faster_whisper_model(model_name: str, resource_mode: str = DEFAULT_RESOURCE_MODE):
+    profile = get_resource_profile(resource_mode)
+    cache_key = f"faster:{model_name}:{profile['threads']}"
+    with model_cache_lock:
+        cached_model = model_cache.get(cache_key)
+        if cached_model is not None:
+            return cached_model
+
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "No se encontro faster-whisper. Instala las dependencias con: pip install -r requirements.txt"
+        ) from exc
+
+    model = WhisperModel(
+        model_name,
+        device="cpu",
+        compute_type="int8",
+        cpu_threads=int(profile["threads"]),
+        download_root=str(MODELS_DIR),
+    )
+    with model_cache_lock:
+        model_cache[cache_key] = model
     return model
 
 
 @contextmanager
-def whisper_progress(job: TranscriptionJob | None):
+def whisper_progress(
+    job: TranscriptionJob | None,
+    *,
+    start_percent: int = 0,
+    end_percent: int = 89,
+    label: str = "",
+):
     if job is None:
         yield
         return
@@ -475,11 +526,13 @@ def whisper_progress(job: TranscriptionJob | None):
             total = getattr(self._bar, "total", 0) or 0
             current = getattr(self._bar, "n", 0) or 0
             if total:
-                whisper_percent = min(99, int((current / total) * 100))
+                raw_percent = min(99, int((current / total) * 100))
+                whisper_percent = min(end_percent, start_percent + int((raw_percent / 100) * (end_percent - start_percent)))
+                label_suffix = f" - {label}" if label else ""
                 update_job(
                     job,
                     status="Transcribiendo",
-                    detail=f"Whisper esta procesando el audio ({whisper_percent}%)",
+                    detail=f"Whisper esta procesando el audio ({whisper_percent}%){label_suffix}",
                     progress=whisper_percent,
                 )
             raise_if_cancelled(job)
@@ -495,6 +548,161 @@ def whisper_progress(job: TranscriptionJob | None):
         transcribe_module.tqdm.tqdm = original_tqdm
 
 
+def media_duration_seconds(path: Path) -> float:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, check=True, text=True)
+        return max(0.0, float(result.stdout.strip() or 0))
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        if path.suffix.lower() == ".wav":
+            try:
+                # 16 kHz, mono, 16-bit PCM = 32,000 bytes per second.
+                return max(0.0, path.stat().st_size / 32000)
+            except OSError:
+                pass
+        return 0.0
+
+
+def split_audio_for_whisper(audio_path: Path, chunk_seconds: int, job: TranscriptionJob | None = None) -> list[Path]:
+    chunk_dir = AUDIO_DIR / f"{audio_path.stem}_chunks"
+    delete_dir_if_inside(chunk_dir, AUDIO_DIR)
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    pattern = chunk_dir / f"{audio_path.stem}_%04d.wav"
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(audio_path),
+        "-f",
+        "segment",
+        "-segment_time",
+        str(chunk_seconds),
+        "-reset_timestamps",
+        "1",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        str(pattern),
+    ]
+
+    update_job(job, status="Preparando audio", detail="Dividiendo audio largo en partes", progress=25)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    set_current_process(job, process)
+    stderr = ""
+    try:
+        while True:
+            try:
+                _, stderr = process.communicate(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                if is_cancel_requested(job):
+                    process.terminate()
+                    try:
+                        process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate()
+                    raise JobCancelled("Cancelado por el usuario.")
+    finally:
+        set_current_process(job, None)
+
+    if process.returncode != 0:
+        error = stderr.strip() or "ffmpeg no pudo dividir el audio."
+        raise RuntimeError(error[-1200:])
+
+    chunks = sorted(chunk_dir.glob("*.wav"))
+    if not chunks:
+        raise RuntimeError("No se generaron partes de audio para Whisper.")
+    return chunks
+
+
+def merge_transcriptions(parts: list[tuple[dict[str, Any], float]]) -> dict[str, Any]:
+    text_parts: list[str] = []
+    merged_segments: list[dict[str, Any]] = []
+    for transcription, offset in parts:
+        text = str(transcription.get("text", "")).strip()
+        if text:
+            text_parts.append(text)
+        for segment in transcription.get("segments", []):
+            merged_segment = dict(segment)
+            for key in ("start", "end"):
+                if key in merged_segment:
+                    try:
+                        merged_segment[key] = float(merged_segment[key]) + offset
+                    except (TypeError, ValueError):
+                        pass
+            merged_segments.append(merged_segment)
+
+    return {"text": "\n".join(text_parts).strip(), "segments": merged_segments}
+
+
+def transcribe_with_faster_whisper(
+    model: Any,
+    audio_path: Path,
+    language: str,
+    job: TranscriptionJob | None,
+    *,
+    duration: float,
+    start_percent: int,
+    end_percent: int,
+    label: str = "",
+) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "beam_size": 1,
+        "condition_on_previous_text": False,
+        "vad_filter": False,
+    }
+    if language:
+        options["language"] = language
+
+    label_suffix = f" - {label}" if label else ""
+    segments_iter, _ = model.transcribe(str(audio_path), **options)
+    segments: list[dict[str, Any]] = []
+    text_parts: list[str] = []
+    for segment in segments_iter:
+        raise_if_cancelled(job)
+        segment_text = str(segment.text or "").strip()
+        if segment_text:
+            text_parts.append(segment_text)
+        segments.append(
+            {
+                "id": len(segments),
+                "start": float(segment.start),
+                "end": float(segment.end),
+                "text": segment_text,
+            }
+        )
+        if duration > 0:
+            chunk_ratio = min(1.0, max(0.0, float(segment.end) / duration))
+            progress = min(end_percent, start_percent + int(chunk_ratio * (end_percent - start_percent)))
+            update_job(
+                job,
+                status="Transcribiendo",
+                detail=f"Faster Whisper esta procesando el audio ({progress}%){label_suffix}",
+                progress=progress,
+            )
+
+    update_job(
+        job,
+        status="Transcribiendo",
+        detail=f"Faster Whisper esta procesando el audio ({end_percent}%){label_suffix}",
+        progress=end_percent,
+    )
+    return {"text": " ".join(text_parts).strip(), "segments": segments}
+
+
 def transcribe_audio(
     audio_path: Path,
     model_name: str,
@@ -503,22 +711,89 @@ def transcribe_audio(
 ) -> dict[str, Any]:
     resource_mode = job.resource_mode if job is not None else DEFAULT_RESOURCE_MODE
     raise_if_cancelled(job)
-    update_job(job, status="Cargando modelo", detail=f"Preparando Whisper {model_name}", progress=30)
-    model = load_whisper_model(model_name, resource_mode=resource_mode)
+    use_faster = TRANSCRIPTION_ENGINE != "openai"
+    engine_label = "Faster Whisper" if use_faster else "Whisper"
+    update_job(job, status="Cargando modelo", detail=f"Preparando {engine_label} {model_name}", progress=30)
+    try:
+        model = load_faster_whisper_model(model_name, resource_mode=resource_mode) if use_faster else load_whisper_model(model_name, resource_mode=resource_mode)
+    except Exception:
+        if not use_faster:
+            raise
+        use_faster = False
+        engine_label = "Whisper"
+        update_job(job, status="Cargando modelo", detail=f"Preparando Whisper {model_name}", progress=30)
+        model = load_whisper_model(model_name, resource_mode=resource_mode)
     apply_resource_limits(resource_mode)
     raise_if_cancelled(job)
     profile = get_resource_profile(resource_mode)
     update_job(
         job,
         status="Transcribiendo",
-        detail=f"Whisper esta procesando el audio (0%) con consumo {profile['label']} ({profile['threads']} hilo/s)",
+        detail=f"{engine_label} esta procesando el audio (0%) con consumo {profile['label']} ({profile['threads']} hilo/s)",
         progress=0,
     )
-    options: dict[str, Any] = {"fp16": False, "verbose": False}
-    if language:
-        options["language"] = language
-    with whisper_progress(job):
-        transcription = model.transcribe(str(audio_path), **options)
+
+    duration = media_duration_seconds(audio_path)
+    if duration > TRANSCRIBE_CHUNK_SECONDS:
+        chunks = split_audio_for_whisper(audio_path, TRANSCRIBE_CHUNK_SECONDS, job=job)
+        parts: list[tuple[dict[str, Any], float]] = []
+        total_chunks = len(chunks)
+        try:
+            for index, chunk_path in enumerate(chunks, start=1):
+                raise_if_cancelled(job)
+                start_percent = int(((index - 1) / total_chunks) * 89)
+                end_percent = max(start_percent + 1, int((index / total_chunks) * 89))
+                label = f"parte {index}/{total_chunks}"
+                update_job(
+                    job,
+                    status="Transcribiendo",
+                    detail=f"{engine_label} esta procesando el audio ({start_percent}%) - {label}",
+                    progress=start_percent,
+                )
+                chunk_duration = media_duration_seconds(chunk_path) or float(TRANSCRIBE_CHUNK_SECONDS)
+                if use_faster:
+                    chunk_transcription = transcribe_with_faster_whisper(
+                        model,
+                        chunk_path,
+                        language,
+                        job,
+                        duration=chunk_duration,
+                        start_percent=start_percent,
+                        end_percent=end_percent,
+                        label=label,
+                    )
+                else:
+                    options: dict[str, Any] = {"fp16": False, "verbose": False}
+                    if language:
+                        options["language"] = language
+                    with whisper_progress(
+                        job,
+                        start_percent=start_percent,
+                        end_percent=end_percent,
+                        label=label,
+                    ):
+                        chunk_transcription = model.transcribe(str(chunk_path), **options)
+                parts.append((chunk_transcription, float((index - 1) * TRANSCRIBE_CHUNK_SECONDS)))
+        finally:
+            delete_dir_if_inside(AUDIO_DIR / f"{audio_path.stem}_chunks", AUDIO_DIR)
+        transcription = merge_transcriptions(parts)
+    else:
+        if use_faster:
+            transcription = transcribe_with_faster_whisper(
+                model,
+                audio_path,
+                language,
+                job,
+                duration=duration,
+                start_percent=0,
+                end_percent=89,
+            )
+        else:
+            options = {"fp16": False, "verbose": False}
+            if language:
+                options["language"] = language
+            with whisper_progress(job):
+                transcription = model.transcribe(str(audio_path), **options)
     raise_if_cancelled(job)
     update_job(job, status="Generando DOCX", detail="Creando documentos de salida", progress=90)
     return transcription
