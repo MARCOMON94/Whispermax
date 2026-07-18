@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -1642,6 +1643,12 @@ def open_browser_when_ready(url: str) -> None:
     threading.Thread(target=_open, daemon=True).start()
 
 
+def is_port_available(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1)
+        return sock.connect_ex((host, port)) != 0
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Servidor local de Whispermax")
     parser.add_argument("--host", default="127.0.0.1")
@@ -1651,6 +1658,11 @@ if __name__ == "__main__":
 
     ensure_output_folders()
     url = f"http://{args.host}:{args.port}"
-    if not args.no_browser:
-        open_browser_when_ready(url)
-    uvicorn.run("main:app", host=args.host, port=args.port, reload=False)
+    if not is_port_available(args.host, args.port):
+        print(f"Whispermax ya esta abierto en {url}. Cierra esa ventana/servidor o usa --port otro_numero.")
+        if not args.no_browser:
+            webbrowser.open(url)
+    else:
+        if not args.no_browser:
+            open_browser_when_ready(url)
+        uvicorn.run("main:app", host=args.host, port=args.port, reload=False)
