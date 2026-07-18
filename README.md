@@ -29,6 +29,7 @@ Cuando subes varios archivos, la app los deja en cola y los transcribe de uno en
 La cola incluye:
 
 - Boton `Cancelar` independiente para cada video.
+- Opcion `Incluir marcas de tiempo` para generar `.txt` y `.docx` con lineas `[HH:MM:SS - HH:MM:SS] texto`.
 - Panel limpio con un unico trabajo activo y su barra de progreso.
 - Lista separada de pendientes, sin barras falsas al 0%.
 - Durante `Transcribiendo`, Whisper se ejecuta con progreso interno activo y la barra usa el porcentaje real que aparece en `Whisper esta procesando el audio (N%)`.

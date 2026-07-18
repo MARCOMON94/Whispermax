@@ -107,6 +107,7 @@ class TranscriptionJob:
     model_name: str
     language: str
     resource_mode: str = DEFAULT_RESOURCE_MODE
+    include_timestamps: bool = False
     status: str = "En cola"
     created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     started_at: str = ""
@@ -192,6 +193,10 @@ def safe_stem(filename: str) -> str:
     return stem.strip("._-") or "video"
 
 
+def is_truthy(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "si", "sí"}
+
+
 def path_inside(path: Path, folder: Path) -> bool:
     try:
         resolved_path = path.resolve()
@@ -221,6 +226,7 @@ def resume_saved_queue() -> None:
             model_name=str(item.get("model_name") or "tiny"),
             language=str(item.get("language") or "es"),
             resource_mode=str(item.get("resource_mode") or DEFAULT_RESOURCE_MODE),
+            include_timestamps=is_truthy(item.get("include_timestamps", False)),
         )
         queued += 1
 
@@ -805,6 +811,7 @@ def write_docx(
     audio_path: Path,
     transcription: dict[str, Any],
     model_name: str,
+    include_timestamps: bool = False,
     job: TranscriptionJob | None = None,
 ) -> tuple[Path, Path]:
     raise_if_cancelled(job)
@@ -812,11 +819,15 @@ def write_docx(
     text = str(transcription.get("text", "")).strip()
     segments = transcription.get("segments", [])
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamped_lines = build_timestamped_lines(segments)
 
     txt_path = TRANSCRIPTIONS_DIR / f"{source_video.stem}_transcripcion.txt"
     docx_path = TRANSCRIPTIONS_DIR / f"{source_video.stem}_transcripcion.docx"
 
-    txt_path.write_text(text + "\n", encoding="utf-8")
+    if include_timestamps and timestamped_lines:
+        txt_path.write_text("\n".join(timestamped_lines) + "\n", encoding="utf-8")
+    else:
+        txt_path.write_text(text + "\n", encoding="utf-8")
 
     document = Document()
     document.add_heading("Transcripcion de video", level=1)
@@ -824,27 +835,35 @@ def write_docx(
     document.add_paragraph(f"Audio extraido: {audio_path.name}")
     document.add_paragraph(f"Modelo Whisper: {model_name}")
     document.add_paragraph(f"Fecha: {timestamp}")
-    document.add_heading("Texto completo", level=2)
-    document.add_paragraph(text or "(Sin texto detectado)")
 
-    if isinstance(segments, list) and segments:
-        document.add_heading("Segmentos", level=2)
-        table = document.add_table(rows=1, cols=3)
-        table.style = "Table Grid"
-        headers = table.rows[0].cells
-        headers[0].text = "Inicio"
-        headers[1].text = "Fin"
-        headers[2].text = "Texto"
-
-        for segment in segments:
-            row = table.add_row().cells
-            row[0].text = format_seconds(segment.get("start", 0))
-            row[1].text = format_seconds(segment.get("end", 0))
-            row[2].text = str(segment.get("text", "")).strip()
+    if include_timestamps and timestamped_lines:
+        document.add_heading("Texto con marcas de tiempo", level=2)
+        for line in timestamped_lines:
+            document.add_paragraph(line)
+    else:
+        document.add_heading("Texto completo", level=2)
+        document.add_paragraph(text or "(Sin texto detectado)")
 
     document.save(docx_path)
     raise_if_cancelled(job)
     return docx_path, txt_path
+
+
+def build_timestamped_lines(segments: Any) -> list[str]:
+    if not isinstance(segments, list):
+        return []
+
+    lines = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        segment_text = str(segment.get("text", "")).strip()
+        if not segment_text:
+            continue
+        start = format_seconds(segment.get("start", 0))
+        end = format_seconds(segment.get("end", 0))
+        lines.append(f"[{start} - {end}] {segment_text}")
+    return lines
 
 
 def format_seconds(value: Any) -> str:
@@ -861,6 +880,7 @@ def transcribe_video(
     video_path: Path,
     model_name: str,
     language: str,
+    include_timestamps: bool = False,
     job: TranscriptionJob | None = None,
 ) -> tuple[Path, Path]:
     audio_path = extract_audio(video_path, job=job)
@@ -870,6 +890,7 @@ def transcribe_video(
         audio_path=audio_path,
         transcription=transcription,
         model_name=model_name,
+        include_timestamps=include_timestamps,
         job=job,
     )
 
@@ -906,7 +927,13 @@ def queue_worker() -> None:
 
             try:
                 apply_resource_limits(resource_mode)
-                docx_path, txt_path = transcribe_video(job.video_path, job.model_name, job.language, job=job)
+                docx_path, txt_path = transcribe_video(
+                    job.video_path,
+                    job.model_name,
+                    job.language,
+                    include_timestamps=job.include_timestamps,
+                    job=job,
+                )
             except JobCancelled as exc:
                 with jobs_lock:
                     job.status = "Cancelado"
@@ -946,6 +973,7 @@ def enqueue_transcription(
     model_name: str,
     language: str,
     resource_mode: str,
+    include_timestamps: bool = False,
 ) -> TranscriptionJob:
     job = TranscriptionJob(
         id=uuid4().hex,
@@ -954,6 +982,7 @@ def enqueue_transcription(
         model_name=model_name,
         language=language,
         resource_mode=resource_mode,
+        include_timestamps=include_timestamps,
     )
     with jobs_lock:
         jobs[job.id] = job
@@ -975,6 +1004,7 @@ def job_to_dict(job: TranscriptionJob) -> dict[str, str]:
         "language": job.language,
         "resource_mode": job.resource_mode,
         "resource_label": str(get_resource_profile(job.resource_mode)["label"]),
+        "include_timestamps": str(job.include_timestamps).lower(),
         "status": job.status,
         "detail": job.detail,
         "progress": progress,
@@ -1009,12 +1039,14 @@ async def transcribe(
     modelo: str = Form("tiny"),
     idioma: str = Form("es"),
     consumo: str = Form(DEFAULT_RESOURCE_MODE),
+    marcas_tiempo: str | None = Form(None),
 ) -> str:
     model_name = modelo.strip() or "tiny"
     language = idioma.strip()
     resource_mode = consumo.strip() or DEFAULT_RESOURCE_MODE
     if resource_mode not in RESOURCE_PROFILES:
         resource_mode = DEFAULT_RESOURCE_MODE
+    include_timestamps = is_truthy(marcas_tiempo)
     ensure_worker_started()
 
     try:
@@ -1033,6 +1065,7 @@ async def transcribe(
                     model_name=model_name,
                     language=language,
                     resource_mode=resource_mode,
+                    include_timestamps=include_timestamps,
                 )
             )
     except HTTPException:
@@ -1303,6 +1336,21 @@ select {
   width: 100%;
 }
 
+input[type="checkbox"] {
+  width: auto;
+}
+
+.option-row {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.option-row label {
+  margin: 0;
+}
+
 .row {
   display: grid;
   gap: 12px;
@@ -1571,6 +1619,11 @@ HTML_PAGE = f"""
               <option value="ultrafast">Ultrarrapido</option>
             </select>
           </div>
+        </div>
+
+        <div class="option-row">
+          <input id="marcas_tiempo" name="marcas_tiempo" type="checkbox" value="on">
+          <label for="marcas_tiempo">Incluir marcas de tiempo</label>
         </div>
 
         <button type="submit">Anadir a cola</button>
